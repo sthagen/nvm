@@ -6,10 +6,11 @@
 # Implemented by Tim Caswell <tim@creationix.com>
 # with much bash help from Matthew Ranney
 
-# "local" warning, quote expansion warning
-# shellcheck disable=SC2039,SC2016,SC2001
+# "local" warning, quote expansion warning, sed warning, `local` warning
+# shellcheck disable=SC2039,SC2016,SC2001,SC3043
 { # this ensures the entire script is downloaded #
 
+# shellcheck disable=SC3028
 NVM_SCRIPT_SOURCE="$_"
 
 nvm_is_zsh() {
@@ -146,7 +147,18 @@ nvm_has_system_iojs() {
 }
 
 nvm_is_version_installed() {
-  [ -n "${1-}" ] && [ -x "$(nvm_version_path "$1" 2>/dev/null)"/bin/node ]
+  if [ -z "${1-}" ]; then
+    return 1
+  fi
+  local NVM_NODE_BINARY
+  NVM_NODE_BINARY='node'
+  if [ "_$(nvm_get_os)" = '_win' ]; then
+    NVM_NODE_BINARY='node.exe'
+  fi
+  if [ -x "$(nvm_version_path "$1" 2>/dev/null)/bin/${NVM_NODE_BINARY}" ]; then
+    return 0
+  fi
+  return 1
 }
 
 nvm_print_npm_version() {
@@ -298,7 +310,7 @@ fi
 if [ -z "${NVM_DIR-}" ]; then
   # shellcheck disable=SC2128
   if [ -n "${BASH_SOURCE-}" ]; then
-    # shellcheck disable=SC2169
+    # shellcheck disable=SC2169,SC3054
     NVM_SCRIPT_SOURCE="${BASH_SOURCE[0]}"
   fi
   NVM_DIR="$(nvm_cd ${NVM_CD_FLAGS} "$(dirname "${NVM_SCRIPT_SOURCE:-$0}")" >/dev/null && \pwd)"
@@ -326,10 +338,14 @@ nvm_tree_contains_path() {
     return 2
   fi
 
+  local previous_pathdir
+  previous_pathdir="${node_path}"
   local pathdir
-  pathdir=$(dirname "${node_path}")
-  while [ "${pathdir}" != "" ] && [ "${pathdir}" != "." ] && [ "${pathdir}" != "/" ] && [ "${pathdir}" != "${tree}" ]; do
-    pathdir=$(dirname "${pathdir}")
+  pathdir=$(dirname "${previous_pathdir}")
+  while [ "${pathdir}" != '' ] && [ "${pathdir}" != '.' ] && [ "${pathdir}" != '/' ] &&
+      [ "${pathdir}" != "${tree}" ] && [ "${pathdir}" != "${previous_pathdir}" ]; do
+    previous_pathdir="${pathdir}"
+    pathdir=$(dirname "${previous_pathdir}")
   done
   [ "${pathdir}" = "${tree}" ]
 }
@@ -953,6 +969,7 @@ nvm_list_aliases() {
     local ALIAS_NAME
     for ALIAS_NAME in "$(nvm_node_prefix)" "stable" "unstable"; do
       {
+        # shellcheck disable=SC2030,SC2031 # (https://github.com/koalaman/shellcheck/issues/2217)
         if [ ! -f "${NVM_ALIAS_DIR}/${ALIAS_NAME}" ] && { [ -z "${ALIAS}" ] || [ "${ALIAS_NAME}" = "${ALIAS}" ]; }; then
           NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_default_alias "${ALIAS_NAME}"
         fi
@@ -960,6 +977,7 @@ nvm_list_aliases() {
     done
     wait
     ALIAS_NAME="$(nvm_iojs_prefix)"
+    # shellcheck disable=SC2030,SC2031 # (https://github.com/koalaman/shellcheck/issues/2217)
     if [ ! -f "${NVM_ALIAS_DIR}/${ALIAS_NAME}" ] && { [ -z "${ALIAS}" ] || [ "${ALIAS_NAME}" = "${ALIAS}" ]; }; then
       NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_CURRENT="${NVM_CURRENT}" nvm_print_default_alias "${ALIAS_NAME}"
     fi
@@ -967,6 +985,7 @@ nvm_list_aliases() {
 
   (
     local LTS_ALIAS
+    # shellcheck disable=SC2030,SC2031 # (https://github.com/koalaman/shellcheck/issues/2217)
     for ALIAS_PATH in "${NVM_ALIAS_DIR}/lts/${ALIAS}"*; do
       {
         LTS_ALIAS="$(NVM_NO_COLORS="${NVM_NO_COLORS-}" NVM_LTS=true nvm_print_alias_path "${NVM_ALIAS_DIR}" "${ALIAS_PATH}")"
@@ -1763,6 +1782,7 @@ nvm_get_os() {
     FreeBSD\ *) NVM_OS=freebsd ;;
     OpenBSD\ *) NVM_OS=openbsd ;;
     AIX\ *) NVM_OS=aix ;;
+    CYGWIN* | MSYS* | MINGW*) NVM_OS=win ;;
   esac
   nvm_echo "${NVM_OS-}"
 }
@@ -1796,6 +1816,14 @@ nvm_get_arch() {
     aarch64) NVM_ARCH="arm64" ;;
     *) NVM_ARCH="${HOST_ARCH}" ;;
   esac
+
+  # If running a 64bit ARM kernel but a 32bit ARM userland, change ARCH to 32bit ARM (armv7l)
+  L=$(ls -dl /sbin/init) #                                         if /sbin/init is 32bit executable
+  if [ "$(uname)" = "Linux" ] && [ "${NVM_ARCH}" = arm64 ] && [ "$(od -An -t x1 -j 4 -N 1 "${L#*-> }")" = ' 01' ]; then
+    NVM_ARCH=armv7l
+    HOST_ARCH=armv7l
+  fi
+
   nvm_echo "${NVM_ARCH}"
 }
 
@@ -1884,23 +1912,37 @@ nvm_install_binary_extract() {
   command mkdir -p "${TMPDIR}" && \
   VERSION_PATH="$(nvm_version_path "${PREFIXED_VERSION}")" || return 1
 
-  local tar_compression_flag
-  tar_compression_flag='z'
-  if nvm_supports_xz "${VERSION}"; then
-    tar_compression_flag='J'
-  fi
-
-  local tar
-  if [ "${NVM_OS}" = 'aix' ]; then
-    tar='gtar'
+  # For Windows system (GitBash with MSYS, Cygwin)
+  if [ "${NVM_OS}" = 'win' ]; then
+    VERSION_PATH="${VERSION_PATH}/bin"
+    command unzip -q "${TARBALL}" -d "${TMPDIR}" || return 1
+  # For non Windows system (including WSL running on Windows)
   else
-    tar='tar'
+    local tar_compression_flag
+    tar_compression_flag='z'
+    if nvm_supports_xz "${VERSION}"; then
+      tar_compression_flag='J'
+    fi
+
+    local tar
+    if [ "${NVM_OS}" = 'aix' ]; then
+      tar='gtar'
+    else
+      tar='tar'
+    fi
+    command "${tar}" -x${tar_compression_flag}f "${TARBALL}" -C "${TMPDIR}" --strip-components 1 || return 1
   fi
-  command "${tar}" -x${tar_compression_flag}f "${TARBALL}" -C "${TMPDIR}" --strip-components 1 || return 1
 
   command mkdir -p "${VERSION_PATH}" || return 1
 
-  command mv "${TMPDIR}/"* "${VERSION_PATH}" || return 1
+  if [ "${NVM_OS}" = 'win' ]; then
+    command mv "${TMPDIR}/"*/* "${VERSION_PATH}" || return 1
+    command chmod +x "${VERSION_PATH}"/node.exe || return 1
+    command chmod +x "${VERSION_PATH}"/npm || return 1
+    command chmod +x "${VERSION_PATH}"/npx 2>/dev/null
+  else
+    command mv "${TMPDIR}/"* "${VERSION_PATH}" || return 1
+  fi
 
   command rm -rf "${TMPDIR}"
 
@@ -2034,7 +2076,9 @@ nvm_get_artifact_compression() {
 
   local COMPRESSION
   COMPRESSION='tar.gz'
-  if nvm_supports_xz "${VERSION}"; then
+  if [ "_${NVM_OS}" = '_win' ]; then
+    COMPRESSION='zip'
+  elif nvm_supports_xz "${VERSION}"; then
     COMPRESSION='tar.xz'
   fi
 
@@ -2401,6 +2445,9 @@ nvm_die_on_prefix() {
     return 3
   fi
 
+  local NVM_OS
+  NVM_OS="$(nvm_get_os)"
+
   # npm normalizes NPM_CONFIG_-prefixed env vars
   # https://github.com/npm/npmconf/blob/22827e4038d6eebaafeb5c13ed2b92cf97b8fb82/npmconf.js#L331-L348
   # https://github.com/npm/npm/blob/5e426a78ca02d0044f8dd26e0c5f881217081cbd/lib/config/core.js#L343-L359
@@ -2412,6 +2459,9 @@ nvm_die_on_prefix() {
   if [ -n "${NVM_NPM_CONFIG_PREFIX_ENV-}" ]; then
     local NVM_CONFIG_VALUE
     eval "NVM_CONFIG_VALUE=\"\$${NVM_NPM_CONFIG_PREFIX_ENV}\""
+    if [ -n "${NVM_CONFIG_VALUE-}" ] && [ "_${NVM_OS}" = "_win" ]; then
+      NVM_CONFIG_VALUE="$(cd "$NVM_CONFIG_VALUE" 2>/dev/null && pwd)"
+    fi
     if [ -n "${NVM_CONFIG_VALUE-}" ] && ! nvm_tree_contains_path "${NVM_DIR}" "${NVM_CONFIG_VALUE}"; then
       nvm deactivate >/dev/null 2>&1
       nvm_err "nvm is not compatible with the \"${NVM_NPM_CONFIG_PREFIX_ENV}\" environment variable: currently set to \"${NVM_CONFIG_VALUE}\""
@@ -2803,7 +2853,7 @@ nvm() {
         nvm_err "\$TERM_PROGRAM: ${TERM_PROGRAM}"
       fi
       nvm_err "\$SHELL: ${SHELL}"
-      # shellcheck disable=SC2169
+      # shellcheck disable=SC2169,SC3028
       nvm_err "\$SHLVL: ${SHLVL-}"
       nvm_err "whoami: '$(whoami)'"
       nvm_err "\${HOME}: ${HOME}"
@@ -3201,8 +3251,13 @@ nvm() {
             nvm_get_make_jobs
           fi
 
-          NVM_NO_PROGRESS="${NVM_NO_PROGRESS:-${noprogress}}" nvm_install_source "${FLAVOR}" std "${VERSION}" "${NVM_MAKE_JOBS}" "${ADDITIONAL_PARAMETERS}"
-          EXIT_CODE=$?
+          if [ "_${NVM_OS}" = "_win" ]; then
+            nvm_err 'Installing from source on non-WSL Windows is not supported'
+            EXIT_CODE=87
+          else
+            NVM_NO_PROGRESS="${NVM_NO_PROGRESS:-${noprogress}}" nvm_install_source "${FLAVOR}" std "${VERSION}" "${NVM_MAKE_JOBS}" "${ADDITIONAL_PARAMETERS}"
+            EXIT_CODE=$?
+          fi
         fi
 
       fi
